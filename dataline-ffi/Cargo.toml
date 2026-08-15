@@ -1,0 +1,17 @@
+[package]
+name = "dataline-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "dataline_ffi"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+[dependencies]
+dataline-core = { path = "../dataline-core" }
+uniffi = { version = "0.32", features = ["cli"] }
+uuid = "1"

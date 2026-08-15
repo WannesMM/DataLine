@@ -1,0 +1,9 @@
+/target/
+**/target/
+.DS_Store
+
+# Intermediate xcframework build output — DataLineFFI.xcframework itself
+# (the actual distributable artifact BaseLine consumes as a local Swift
+# package dependency) stays tracked; these are scratch/build-cache dirs.
+xcframework/.build/
+xcframework/universal-macos/
