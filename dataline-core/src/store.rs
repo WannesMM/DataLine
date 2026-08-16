@@ -42,7 +42,7 @@ use crate::record::{BlobRef, Record, Value};
 use crate::reference::Reference;
 use crate::schema::{Database, FieldDefinition, FieldKind, SchemaRegistry, SelectionOption};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// What happened to existing records' values when [`Store::retype_field`]
 /// changed a field's kind. Per Architecture.md §7, a retype never silently
@@ -64,11 +64,17 @@ impl Store {
     /// doesn't exist yet, or rehydrating the in-memory registry from an
     /// existing store's schema rows otherwise.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        // WAL keeps writers and readers from blocking each other and survives a
+        // crash mid-write (the WAL replays on next open); NORMAL sync is safe under
+        // WAL because a crash can only lose the last few not-yet-checkpointed
+        // commits, never corrupt the database file itself.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
 
         if table_exists(&conn, "_dataline_meta")? {
-            check_schema_version(&conn)?;
+            check_schema_version(&mut conn)?;
         } else {
             create_schema_tables(&conn)?;
         }
@@ -76,6 +82,14 @@ impl Store {
         let registry = load_registry(&conn)?;
 
         Ok(Self { conn, registry })
+    }
+
+    /// Flushes the WAL back into the main database file so a plain file copy
+    /// of the store (e.g. for a backup snapshot) is self-consistent without
+    /// also having to copy the `-wal`/`-shm` sidecar files.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+        Ok(())
     }
 
     pub fn get_database(&self, id: DatabaseId) -> Result<&Database> {
@@ -215,6 +229,18 @@ impl Store {
         self.with_persisted_mutation(|registry| registry.duplicate_database_schema(database_id, new_name))
     }
 
+    /// Removes a database, its records, and every field on any other
+    /// database that referenced it — see
+    /// [`SchemaRegistry::remove_database`]. Its own record table (and any
+    /// `links` rows for records that lived in it) are dropped in the same
+    /// transaction as the schema change; join tables for reference fields
+    /// it owned or was pointed at by are dropped the same way an ordinary
+    /// `remove_field` drops one (`persist_diff`'s field-removal pass covers
+    /// both).
+    pub fn delete_database(&mut self, database_id: DatabaseId) -> Result<()> {
+        self.with_persisted_mutation(|registry| registry.remove_database(database_id))
+    }
+
     /// Creates a new, empty record in `database_id` and returns its `Link`.
     pub fn create_record(&mut self, database_id: DatabaseId) -> Result<Link> {
         self.registry.get_database(database_id)?;
@@ -267,6 +293,9 @@ impl Store {
         }
         drop(rows);
         drop(stmt);
+        for value in values.values_mut() {
+            self.hydrate_blob_filename(value)?;
+        }
 
         for field_id in reference_fields {
             let refs = self.list_references(link, field_id)?;
@@ -314,10 +343,24 @@ impl Store {
                 let refs = self.list_references(link, field_id)?;
                 values.insert(field_id, Value::Reference(refs.into_iter().map(|r| r.target_link).collect()));
             }
+            for value in values.values_mut() {
+                self.hydrate_blob_filename(value)?;
+            }
             records.push(Record { link, database_id, values, created_at, updated_at });
         }
 
         Ok(records)
+    }
+
+    /// Fills in a decoded `Value::Blob`'s filename from the `blobs` table —
+    /// `decode_scalar_value` is a pure function with no database access, so
+    /// it can only produce a bare-hash `BlobRef`; this is the one place that
+    /// hydrates it into the real thing `get_record`/`list_records` return.
+    fn hydrate_blob_filename(&self, value: &mut Value) -> Result<()> {
+        if let Value::Blob(blob_ref) = value {
+            blob_ref.filename = self.blob_filename(&blob_ref.hash)?;
+        }
+        Ok(())
     }
 
     fn field_lists(&self, database_id: DatabaseId) -> Result<(Vec<FieldDefinition>, Vec<FieldId>)> {
@@ -585,18 +628,27 @@ impl Store {
     }
 
     /// Writes `bytes` into the store's content-addressed blob table
-    /// (Architecture.md §5) and returns a handle to them. Writing the same
-    /// content twice is a no-op the second time — `BlobRef`s are content
-    /// hashes, so identical bytes always produce the identical handle, and
-    /// `INSERT OR IGNORE` skips the redundant write rather than erroring.
-    pub fn write_blob(&mut self, bytes: &[u8]) -> Result<BlobRef> {
+    /// (Architecture.md §5) and returns a handle to them, along with
+    /// `filename` if given (the file's original name — real per-blob
+    /// metadata the engine now carries natively, not something a caller has
+    /// to smuggle in through a separate value; see [`Value::Json`]'s doc
+    /// comment for the analogous fix on the structured-data side). Writing
+    /// the same *content* twice is a no-op the second time regardless of
+    /// filename — `BlobRef`s dedupe by content hash, so identical bytes
+    /// always produce the identical handle, and `INSERT OR IGNORE` skips the
+    /// redundant write; the returned `BlobRef` reflects whichever filename
+    /// was actually stored on the first write, which may not be the one
+    /// just passed in if this exact content already existed under a
+    /// different name.
+    pub fn write_blob(&mut self, bytes: &[u8], filename: Option<&str>) -> Result<BlobRef> {
         let hash = sha256_hex(bytes);
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT OR IGNORE INTO blobs (hash, bytes, created_at) VALUES (?1, ?2, ?3)",
-            params![hash, bytes, now],
+            "INSERT OR IGNORE INTO blobs (hash, bytes, filename, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![hash, bytes, filename, now],
         )?;
-        Ok(BlobRef::from_hash(hash))
+        let stored_filename = self.blob_filename(&hash)?;
+        Ok(BlobRef::from_hash_and_filename(hash, stored_filename))
     }
 
     /// Reads back the bytes behind a [`BlobRef`]. Since a `BlobRef` is only
@@ -608,9 +660,19 @@ impl Store {
     /// scope of its own, not something to bolt on here).
     pub fn read_blob(&self, blob_ref: &BlobRef) -> Result<Vec<u8>> {
         self.conn
-            .query_row("SELECT bytes FROM blobs WHERE hash = ?1", params![blob_ref.0], |row| row.get(0))
+            .query_row("SELECT bytes FROM blobs WHERE hash = ?1", params![blob_ref.hash], |row| row.get(0))
             .optional()?
             .ok_or_else(|| DataLineError::BlobNotFound(blob_ref.clone()))
+    }
+
+    fn blob_filename(&self, hash: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT filename FROM blobs WHERE hash = ?1", params![hash], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()
+            .map(Option::flatten)
+            .map_err(DataLineError::from)
     }
 
     fn resolve_database_id(&self, link: Link) -> Result<DatabaseId> {
@@ -751,6 +813,18 @@ impl Store {
             }
         }
 
+        // Databases removed since `before` — dropped last, after every field
+        // that lived on them (including paired back-references on databases
+        // they pointed at) has already been deleted above, so the `fields`
+        // FK to `databases` is never violated.
+        for db in before.list_databases() {
+            if self.registry.get_database(db.id).is_err() {
+                tx.execute("DELETE FROM links WHERE database_id = ?1", params![db.id.as_uuid().to_string()])?;
+                tx.execute("DELETE FROM databases WHERE id = ?1", params![db.id.as_uuid().to_string()])?;
+                tx.execute(&format!("DROP TABLE IF EXISTS \"{}\"", database_table_name(db.id)), [])?;
+            }
+        }
+
         tx.commit()?;
         Ok(())
     }
@@ -829,6 +903,7 @@ fn scalar_sql_type(kind: &FieldKind) -> Option<&'static str> {
         FieldKind::Date => Some("TEXT"),
         FieldKind::Blob => Some("TEXT"), // stores a content hash, not bytes — see Architecture.md §5
         FieldKind::Selection { .. } => Some("TEXT"),
+        FieldKind::Json => Some("TEXT"), // stores raw JSON text — see Value::Json
         FieldKind::Reference { .. } => None,
     }
 }
@@ -841,6 +916,7 @@ fn kind_label(kind: &FieldKind) -> &'static str {
         FieldKind::Date => "date",
         FieldKind::Selection { .. } => "selection",
         FieldKind::Blob => "blob",
+        FieldKind::Json => "json",
         FieldKind::Reference { .. } => "reference",
     }
 }
@@ -880,6 +956,7 @@ fn create_schema_tables(conn: &Connection) -> rusqlite::Result<()> {
          CREATE TABLE blobs (
              hash TEXT PRIMARY KEY,
              bytes BLOB NOT NULL,
+             filename TEXT,
              created_at TEXT NOT NULL
          );",
     )?;
@@ -890,17 +967,59 @@ fn create_schema_tables(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn check_schema_version(conn: &Connection) -> Result<()> {
+/// One version's upgrade step: takes the store from `from` to `from + 1`.
+/// Add a new entry here (and bump `SCHEMA_VERSION`) for every future format
+/// change rather than writing a fresh one-off `if` — that's what lets a
+/// store several versions behind the current build walk forward through
+/// each intermediate step in one open, instead of only the single version
+/// jump a hard-coded check could special-case.
+type MigrationStep = fn(&Transaction) -> rusqlite::Result<()>;
+
+const MIGRATIONS: &[(i64, MigrationStep)] = &[
+    // v1 -> v2: adds `blobs.filename`.
+    (1, |tx| tx.execute("ALTER TABLE blobs ADD COLUMN filename TEXT", []).map(|_| ())),
+];
+
+/// Checks the store's schema version, migrating forward in place through
+/// every intermediate step this build knows about (see `MIGRATIONS`) —
+/// e.g. a v1 store opened by a build several versions ahead upgrades v1→v2,
+/// v2→v3, etc. in one open, all inside a single transaction so a failure
+/// partway through never leaves the store on an undocumented in-between
+/// version. A version this build has no migration path *to* — either
+/// because it's newer than `SCHEMA_VERSION` (an older build opening a newer
+/// file) or because a migration step is missing — is a hard error rather
+/// than a guess; there's no reason to trust an unknown version is safe to
+/// read or write.
+fn check_schema_version(conn: &mut Connection) -> Result<()> {
     let value: String = conn
         .query_row("SELECT value FROM _dataline_meta WHERE key = 'schema_version'", [], |row| row.get(0))
         .map_err(DataLineError::from)?;
     let version: i64 =
         value.parse().map_err(|_| DataLineError::Storage(format!("invalid schema_version value: {value}")))?;
-    if version != SCHEMA_VERSION {
+
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version > SCHEMA_VERSION {
         return Err(DataLineError::Storage(format!(
             "store schema version {version} is not supported by this build (expected {SCHEMA_VERSION})"
         )));
     }
+
+    let tx = conn.transaction().map_err(DataLineError::from)?;
+    let mut current = version;
+    while current < SCHEMA_VERSION {
+        let Some((_, step)) = MIGRATIONS.iter().find(|(from, _)| *from == current) else {
+            return Err(DataLineError::Storage(format!(
+                "store schema version {version} is not supported by this build (expected {SCHEMA_VERSION}, no migration from {current})"
+            )));
+        };
+        step(&tx).map_err(DataLineError::from)?;
+        current += 1;
+    }
+    tx.execute("UPDATE _dataline_meta SET value = ?1 WHERE key = 'schema_version'", params![SCHEMA_VERSION.to_string()])
+        .map_err(DataLineError::from)?;
+    tx.commit().map_err(DataLineError::from)?;
     Ok(())
 }
 
@@ -967,7 +1086,7 @@ fn encode_kind(kind: &FieldKind) -> rusqlite::Result<EncodedKind> {
         reference_paired_field: None,
     };
     Ok(match kind {
-        FieldKind::Text | FieldKind::Number | FieldKind::Boolean | FieldKind::Date | FieldKind::Blob => {
+        FieldKind::Text | FieldKind::Number | FieldKind::Boolean | FieldKind::Date | FieldKind::Blob | FieldKind::Json => {
             EncodedKind { kind_tag: kind_label(kind), ..empty }
         }
         FieldKind::Selection { multi, options } => {
@@ -1002,6 +1121,7 @@ fn decode_kind(
         "boolean" => FieldKind::Boolean,
         "date" => FieldKind::Date,
         "blob" => FieldKind::Blob,
+        "json" => FieldKind::Json,
         "selection" => {
             let multi = selection_multi.unwrap_or(0) != 0;
             let options: Vec<SelectionOption> = match selection_options {
@@ -1093,7 +1213,12 @@ fn encode_scalar_value(field_id: FieldId, kind: &FieldKind, value: &Value) -> Re
             let json = serde_json::to_string(names).map_err(|e| DataLineError::Storage(e.to_string()))?;
             Ok(SqlValue::Text(json))
         }
-        (FieldKind::Blob, Value::Blob(blob_ref)) => Ok(SqlValue::Text(blob_ref.0.clone())),
+        (FieldKind::Blob, Value::Blob(blob_ref)) => Ok(SqlValue::Text(blob_ref.hash.clone())),
+        (FieldKind::Json, Value::Json(json)) => {
+            serde_json::from_str::<serde_json::Value>(json)
+                .map_err(|e| DataLineError::Storage(format!("invalid JSON value: {e}")))?;
+            Ok(SqlValue::Text(json.clone()))
+        }
         _ => Err(DataLineError::ValueKindMismatch { field: field_id, expected: kind_label(kind) }),
     }
 }
@@ -1120,6 +1245,7 @@ fn decode_scalar_value(kind: &FieldKind, sql_value: rusqlite::types::Value) -> R
             Value::Selection(names)
         }
         FieldKind::Blob => Value::Blob(BlobRef::from_hash(expect_text(sql_value)?)),
+        FieldKind::Json => Value::Json(expect_text(sql_value)?),
         FieldKind::Reference { .. } => {
             unreachable!("reference fields never get a column on their owning table (Architecture.md §3)")
         }
@@ -1148,6 +1274,7 @@ fn coerce_value(value: &Value, target_kind: &FieldKind) -> Value {
         (Value::Boolean(_), FieldKind::Boolean) => value.clone(),
         (Value::Date(_), FieldKind::Date) => value.clone(),
         (Value::Blob(_), FieldKind::Blob) => value.clone(),
+        (Value::Json(_), FieldKind::Json) => value.clone(),
         (Value::Selection(names), FieldKind::Selection { options, .. }) => {
             // Also how a Selection option removal is handled: retyping a
             // field to itself with a narrower `options` list drops any
@@ -1167,6 +1294,10 @@ fn coerce_value(value: &Value, target_kind: &FieldKind) -> Value {
             _ => Value::Empty,
         },
         (Value::Text(s), FieldKind::Date) => s.parse().map(Value::Date).unwrap_or(Value::Empty),
+        (Value::Text(s), FieldKind::Json) => {
+            if serde_json::from_str::<serde_json::Value>(s).is_ok() { Value::Json(s.clone()) } else { Value::Empty }
+        }
+        (Value::Json(s), FieldKind::Text) => Value::Text(s.clone()),
         (Value::Text(s), FieldKind::Selection { options, .. }) => {
             if options.iter().any(|o| &o.name == s) {
                 Value::Selection(vec![s.clone()])
@@ -1397,6 +1528,50 @@ mod tests {
     }
 
     #[test]
+    fn set_value_round_trips_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp_store_path(&dir)).unwrap();
+        let card = store.create_database("Card").unwrap();
+        let field = store.add_field(card, "Style", FieldKind::Json).unwrap();
+        let link = store.create_record(card).unwrap();
+
+        store.set_value(link, field, Value::Json(r##"{"kind":"gradient","stops":["#fff","#000"]}"##.into())).unwrap();
+
+        let record = store.get_record(link).unwrap();
+        assert_eq!(record.values[&field], Value::Json(r##"{"kind":"gradient","stops":["#fff","#000"]}"##.into()));
+    }
+
+    #[test]
+    fn set_value_rejects_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp_store_path(&dir)).unwrap();
+        let card = store.create_database("Card").unwrap();
+        let field = store.add_field(card, "Style", FieldKind::Json).unwrap();
+        let link = store.create_record(card).unwrap();
+
+        let err = store.set_value(link, field, Value::Json("not json".into())).unwrap_err();
+        assert!(matches!(err, DataLineError::Storage(_)));
+    }
+
+    #[test]
+    fn json_field_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_store_path(&dir);
+        let card;
+        let field;
+        let link;
+        {
+            let mut store = Store::open(&path).unwrap();
+            card = store.create_database("Card").unwrap();
+            field = store.add_field(card, "Style", FieldKind::Json).unwrap();
+            link = store.create_record(card).unwrap();
+            store.set_value(link, field, Value::Json(r#"{"a":1}"#.into())).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.get_record(link).unwrap().values[&field], Value::Json(r#"{"a":1}"#.into()));
+    }
+
+    #[test]
     fn set_value_can_clear_back_to_empty() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(temp_store_path(&dir)).unwrap();
@@ -1442,7 +1617,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(temp_store_path(&dir)).unwrap();
 
-        let blob_ref = store.write_blob(b"pretend this is a texture").unwrap();
+        let blob_ref = store.write_blob(b"pretend this is a texture", None).unwrap();
         let bytes = store.read_blob(&blob_ref).unwrap();
 
         assert_eq!(bytes, b"pretend this is a texture");
@@ -1453,9 +1628,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(temp_store_path(&dir)).unwrap();
 
-        let a = store.write_blob(b"same bytes").unwrap();
-        let b = store.write_blob(b"same bytes").unwrap();
-        let c = store.write_blob(b"different bytes").unwrap();
+        let a = store.write_blob(b"same bytes", None).unwrap();
+        let b = store.write_blob(b"same bytes", None).unwrap();
+        let c = store.write_blob(b"different bytes", None).unwrap();
 
         assert_eq!(a, b, "identical content must produce the identical handle");
         assert_ne!(a, c);
@@ -1466,11 +1641,50 @@ mod tests {
     }
 
     #[test]
+    fn write_blob_stores_and_returns_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp_store_path(&dir)).unwrap();
+
+        let blob_ref = store.write_blob(b"song bytes", Some("track.mp3")).unwrap();
+        assert_eq!(blob_ref.filename(), Some("track.mp3"));
+    }
+
+    #[test]
+    fn write_blob_same_content_keeps_first_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp_store_path(&dir)).unwrap();
+
+        let first = store.write_blob(b"same bytes", Some("first.mp3")).unwrap();
+        let second = store.write_blob(b"same bytes", Some("second.mp3")).unwrap();
+
+        assert_eq!(first.filename(), Some("first.mp3"));
+        assert_eq!(second.filename(), Some("first.mp3"), "content dedup keeps whichever filename was written first");
+    }
+
+    #[test]
+    fn blob_filename_round_trips_through_get_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp_store_path(&dir)).unwrap();
+        let db = store.create_database("Card").unwrap();
+        let field = store.add_field(db, "Art", FieldKind::Blob).unwrap();
+        let link = store.create_record(db).unwrap();
+
+        let blob_ref = store.write_blob(b"art bytes", Some("art.png")).unwrap();
+        store.set_value(link, field, Value::Blob(blob_ref)).unwrap();
+
+        let record = store.get_record(link).unwrap();
+        match &record.values[&field] {
+            Value::Blob(blob_ref) => assert_eq!(blob_ref.filename(), Some("art.png")),
+            other => panic!("expected Blob, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn read_blob_missing_errors() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(temp_store_path(&dir)).unwrap();
 
-        let bogus = BlobRef("not-a-real-hash".to_string());
+        let bogus = BlobRef::from_hash("not-a-real-hash");
         assert_eq!(store.read_blob(&bogus).unwrap_err(), DataLineError::BlobNotFound(bogus));
     }
 
@@ -1482,7 +1696,7 @@ mod tests {
         let artwork_field = store.add_field(card, "Artwork", FieldKind::Blob).unwrap();
         let link = store.create_record(card).unwrap();
 
-        let blob_ref = store.write_blob(b"pretend artwork bytes").unwrap();
+        let blob_ref = store.write_blob(b"pretend artwork bytes", None).unwrap();
         store.set_value(link, artwork_field, Value::Blob(blob_ref.clone())).unwrap();
 
         let record = store.get_record(link).unwrap();
@@ -1528,13 +1742,13 @@ mod tests {
         let card = store.create_database("Card").unwrap();
         let artwork_field = store.add_field(card, "Artwork", FieldKind::Blob).unwrap();
 
-        let blob_ref = store.write_blob(b"shared texture").unwrap();
+        let blob_ref = store.write_blob(b"shared texture", None).unwrap();
         let a = store.create_record(card).unwrap();
         store.set_value(a, artwork_field, Value::Blob(blob_ref.clone())).unwrap();
         let b = store.create_record(card).unwrap();
         store.set_value(b, artwork_field, Value::Blob(blob_ref.clone())).unwrap();
         let c = store.create_record(card).unwrap();
-        let other_blob = store.write_blob(b"other texture").unwrap();
+        let other_blob = store.write_blob(b"other texture", None).unwrap();
         store.set_value(c, artwork_field, Value::Blob(other_blob)).unwrap();
 
         let matches = store.find_by_value(card, artwork_field, Value::Blob(blob_ref)).unwrap();
@@ -1552,7 +1766,7 @@ mod tests {
             let card = store.create_database("Card").unwrap();
             let field = store.add_field(card, "Artwork", FieldKind::Blob).unwrap();
             let link = store.create_record(card).unwrap();
-            let blob_ref = store.write_blob(b"persisted bytes").unwrap();
+            let blob_ref = store.write_blob(b"persisted bytes", None).unwrap();
             store.set_value(link, field, Value::Blob(blob_ref.clone())).unwrap();
             (card, link, field, blob_ref)
         };
@@ -2101,6 +2315,53 @@ mod tests {
     }
 
     #[test]
+    fn delete_database_removes_it_and_its_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_store_path(&dir);
+        let mut store = Store::open(&path).unwrap();
+
+        let card = store.create_database("Card").unwrap();
+        store.add_field(card, "Name", FieldKind::Text).unwrap();
+        store.create_record(card).unwrap();
+
+        store.delete_database(card).unwrap();
+
+        assert_eq!(store.get_database(card).unwrap_err(), DataLineError::DatabaseNotFound(card));
+        assert!(!table_exists(&store.conn, &database_table_name(card)).unwrap());
+
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.get_database(card).unwrap_err(), DataLineError::DatabaseNotFound(card));
+    }
+
+    #[test]
+    fn delete_database_removes_fields_referencing_it_from_surviving_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_store_path(&dir);
+        let mut store = Store::open(&path).unwrap();
+
+        let card = store.create_database("Card").unwrap();
+        let balance = store.create_database("Balance change").unwrap();
+        store
+            .add_field(card, "Balance change", FieldKind::Reference { target_database: balance, paired_field: None })
+            .unwrap();
+
+        store.delete_database(balance).unwrap();
+
+        assert!(store.get_database(card).unwrap().fields.is_empty());
+
+        let reopened = Store::open(&path).unwrap();
+        assert!(reopened.get_database(card).unwrap().fields.is_empty());
+    }
+
+    #[test]
+    fn delete_missing_database_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp_store_path(&dir)).unwrap();
+        let missing = DatabaseId::new();
+        assert_eq!(store.delete_database(missing).unwrap_err(), DataLineError::DatabaseNotFound(missing));
+    }
+
+    #[test]
     fn retype_field_lossless_conversion_preserves_every_value() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(temp_store_path(&dir)).unwrap();
@@ -2282,6 +2543,50 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_v1_store_migrates_blobs_table_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_store_path(&dir);
+
+        // Hand-build a v1 store (blobs table with no filename column,
+        // schema_version 1) — what every store on disk before this
+        // migration was shaped like.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _dataline_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE databases (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                 CREATE TABLE fields (
+                     id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id),
+                     name TEXT NOT NULL, kind TEXT NOT NULL, selection_multi INTEGER,
+                     selection_options TEXT, reference_target_database TEXT,
+                     reference_paired_field TEXT, ordering INTEGER NOT NULL
+                 );
+                 CREATE TABLE links (link TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id));
+                 CREATE TABLE blobs (hash TEXT PRIMARY KEY, bytes BLOB NOT NULL, created_at TEXT NOT NULL);
+                 INSERT INTO _dataline_meta (key, value) VALUES ('schema_version', '1');",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO blobs (hash, bytes, created_at) VALUES ('abc', X'01020304', '2024-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let mut store = Store::open(&path).unwrap();
+        // The migrated column is usable — a fresh write with a filename
+        // round-trips, and the pre-migration row (filename NULL) still reads
+        // back fine as `None`.
+        let blob_ref = store.write_blob(b"new bytes", Some("new.bin")).unwrap();
+        assert_eq!(blob_ref.filename(), Some("new.bin"));
+
+        let conn = Connection::open(&path).unwrap();
+        let version: String =
+            conn.query_row("SELECT value FROM _dataline_meta WHERE key = 'schema_version'", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
     fn unsupported_schema_version_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = temp_store_path(&dir);
@@ -2297,6 +2602,37 @@ mod tests {
             Err(DataLineError::Storage(msg)) => assert!(msg.contains("999")),
             Err(other) => panic!("expected Storage error, got {other:?}"),
             Ok(_) => panic!("expected schema version mismatch to be rejected"),
+        }
+    }
+
+    #[test]
+    fn opening_a_store_enables_wal_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_store_path(&dir);
+        let store = Store::open(&path).unwrap();
+
+        let mode: String = store.conn.query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+
+        let sync: i64 = store.conn.query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+        assert_eq!(sync, 1, "synchronous should be NORMAL (1)");
+    }
+
+    #[test]
+    fn checkpoint_truncates_the_wal_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_store_path(&dir);
+        let mut store = Store::open(&path).unwrap();
+
+        let db_id = store.create_database("Notes").unwrap();
+        store.add_field(db_id, "Title", FieldKind::Text).unwrap();
+
+        store.checkpoint().unwrap();
+
+        let wal_path = path.with_extension("sqlite-wal");
+        if wal_path.exists() {
+            let size = std::fs::metadata(&wal_path).unwrap().len();
+            assert_eq!(size, 0, "checkpoint should truncate the WAL file");
         }
     }
 

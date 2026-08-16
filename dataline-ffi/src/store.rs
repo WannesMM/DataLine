@@ -39,8 +39,8 @@ pub(crate) fn parse_reference_id(s: &str) -> Result<dataline_core::ReferenceId, 
     Ok(dataline_core::ReferenceId::from_uuid(parse_uuid(s)?))
 }
 
-pub(crate) fn blob_ref_from_hash(hash: String) -> dataline_core::BlobRef {
-    dataline_core::BlobRef::from_hash(hash)
+pub(crate) fn blob_ref_from_hash(hash: String, filename: Option<String>) -> dataline_core::BlobRef {
+    dataline_core::BlobRef::from_hash_and_filename(hash, filename)
 }
 
 #[derive(uniffi::Object)]
@@ -56,6 +56,15 @@ impl Store {
         Ok(Arc::new(Self { inner: Mutex::new(store) }))
     }
 
+    /// Flushes the WAL back into the main database file — call before
+    /// copying the store file for a backup snapshot, so the copy is
+    /// self-consistent without also needing the `-wal`/`-shm` sidecars.
+    pub fn checkpoint(&self) -> Result<(), DataLineError> {
+        let inner = self.inner.lock().unwrap();
+        inner.checkpoint()?;
+        Ok(())
+    }
+
     // ---- Schema management ----
 
     pub fn create_database(&self, name: String) -> Result<String, DataLineError> {
@@ -66,6 +75,12 @@ impl Store {
     pub fn duplicate_database_schema(&self, database_id: String, new_name: String) -> Result<String, DataLineError> {
         let mut inner = self.inner.lock().unwrap();
         Ok(inner.duplicate_database_schema(parse_database_id(&database_id)?, new_name)?.to_string())
+    }
+
+    pub fn delete_database(&self, database_id: String) -> Result<(), DataLineError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.delete_database(parse_database_id(&database_id)?)?;
+        Ok(())
     }
 
     pub fn add_field(&self, database_id: String, name: String, kind: FieldKind) -> Result<String, DataLineError> {
@@ -196,14 +211,14 @@ impl Store {
 
     // ---- Blobs ----
 
-    pub fn write_blob(&self, bytes: Vec<u8>) -> Result<String, DataLineError> {
+    pub fn write_blob(&self, bytes: Vec<u8>, filename: Option<String>) -> Result<String, DataLineError> {
         let mut inner = self.inner.lock().unwrap();
-        Ok(inner.write_blob(&bytes)?.hash().to_string())
+        Ok(inner.write_blob(&bytes, filename.as_deref())?.hash().to_string())
     }
 
     pub fn read_blob(&self, hash: String) -> Result<Vec<u8>, DataLineError> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner.read_blob(&blob_ref_from_hash(hash))?)
+        Ok(inner.read_blob(&blob_ref_from_hash(hash, None))?)
     }
 }
 

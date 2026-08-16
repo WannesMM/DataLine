@@ -263,6 +263,11 @@ uint64_t uniffi_dataline_ffi_fn_constructor_store_open(RustBuffer path, RustCall
 RustBuffer uniffi_dataline_ffi_fn_method_store_add_field(uint64_t ptr, RustBuffer database_id, RustBuffer name, RustBuffer kind, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_FN_METHOD_STORE_CHECKPOINT
+#define UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_FN_METHOD_STORE_CHECKPOINT
+void uniffi_dataline_ffi_fn_method_store_checkpoint(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_FN_METHOD_STORE_CREATE_DATABASE
 #define UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_FN_METHOD_STORE_CREATE_DATABASE
 RustBuffer uniffi_dataline_ffi_fn_method_store_create_database(uint64_t ptr, RustBuffer name, RustCallStatus *_Nonnull out_status
@@ -276,6 +281,11 @@ RustBuffer uniffi_dataline_ffi_fn_method_store_create_record(uint64_t ptr, RustB
 #ifndef UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_FN_METHOD_STORE_CREATE_REFERENCE
 #define UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_FN_METHOD_STORE_CREATE_REFERENCE
 RustBuffer uniffi_dataline_ffi_fn_method_store_create_reference(uint64_t ptr, RustBuffer source_link, RustBuffer source_field, RustBuffer target_link, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_FN_METHOD_STORE_DELETE_DATABASE
+#define UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_FN_METHOD_STORE_DELETE_DATABASE
+void uniffi_dataline_ffi_fn_method_store_delete_database(uint64_t ptr, RustBuffer database_id, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_FN_METHOD_STORE_DELETE_RECORD
@@ -360,7 +370,7 @@ void uniffi_dataline_ffi_fn_method_store_set_value(uint64_t ptr, RustBuffer link
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_FN_METHOD_STORE_WRITE_BLOB
 #define UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_FN_METHOD_STORE_WRITE_BLOB
-RustBuffer uniffi_dataline_ffi_fn_method_store_write_blob(uint64_t ptr, RustBuffer bytes, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_dataline_ffi_fn_method_store_write_blob(uint64_t ptr, RustBuffer bytes, RustBuffer filename, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_FN_FUNC_DATALINE_VERSION
@@ -641,6 +651,12 @@ uint16_t uniffi_dataline_ffi_checksum_method_store_add_field(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_CHECKSUM_METHOD_STORE_CHECKPOINT
+#define UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_CHECKSUM_METHOD_STORE_CHECKPOINT
+uint16_t uniffi_dataline_ffi_checksum_method_store_checkpoint(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_CHECKSUM_METHOD_STORE_CREATE_DATABASE
 #define UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_CHECKSUM_METHOD_STORE_CREATE_DATABASE
 uint16_t uniffi_dataline_ffi_checksum_method_store_create_database(void
@@ -656,6 +672,12 @@ uint16_t uniffi_dataline_ffi_checksum_method_store_create_record(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_CHECKSUM_METHOD_STORE_CREATE_REFERENCE
 #define UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_CHECKSUM_METHOD_STORE_CREATE_REFERENCE
 uint16_t uniffi_dataline_ffi_checksum_method_store_create_reference(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_CHECKSUM_METHOD_STORE_DELETE_DATABASE
+#define UNIFFI_FFIDEF_UNIFFI_DATALINE_FFI_CHECKSUM_METHOD_STORE_DELETE_DATABASE
+uint16_t uniffi_dataline_ffi_checksum_method_store_delete_database(void
     
 );
 #endif

@@ -34,6 +34,8 @@ pub enum FieldKind {
     /// value for this today (see that method's tests).
     Reference { target_database: String, paired_field: Option<String> },
     Blob,
+    /// See `dataline_core::Value::Json`'s doc comment.
+    Json,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
@@ -61,8 +63,12 @@ pub enum Value {
     Date(String),
     /// Links, as id strings.
     Reference(Vec<String>),
-    /// A blob's content hash, as returned by `Store::write_blob`.
-    Blob(String),
+    /// `hash` is a blob's content hash, as returned by `Store::write_blob`.
+    /// `filename` is whatever was passed to `write_blob`, if anything —
+    /// `None` for a blob written without one, not a lookup failure.
+    Blob { hash: String, filename: Option<String> },
+    /// Raw JSON text — see `dataline_core::Value::Json`'s doc comment.
+    Json(String),
     Empty,
 }
 
@@ -113,6 +119,7 @@ pub(crate) fn field_kind_from_core(kind: dataline_core::FieldKind) -> FieldKind 
         dataline_core::FieldKind::Boolean => FieldKind::Boolean,
         dataline_core::FieldKind::Date => FieldKind::Date,
         dataline_core::FieldKind::Blob => FieldKind::Blob,
+        dataline_core::FieldKind::Json => FieldKind::Json,
         dataline_core::FieldKind::Selection { multi, options } => {
             FieldKind::Selection { multi, options: options.into_iter().map(selection_option_from_core).collect() }
         }
@@ -130,6 +137,7 @@ pub(crate) fn field_kind_to_core(kind: FieldKind) -> Result<dataline_core::Field
         FieldKind::Boolean => dataline_core::FieldKind::Boolean,
         FieldKind::Date => dataline_core::FieldKind::Date,
         FieldKind::Blob => dataline_core::FieldKind::Blob,
+        FieldKind::Json => dataline_core::FieldKind::Json,
         FieldKind::Selection { multi, options } => dataline_core::FieldKind::Selection {
             multi,
             options: options.into_iter().map(selection_option_to_core).collect(),
@@ -162,7 +170,10 @@ pub(crate) fn value_from_core(value: dataline_core::Value) -> Value {
         dataline_core::Value::Selection(names) => Value::Selection(names),
         dataline_core::Value::Date(d) => Value::Date(d.to_string()),
         dataline_core::Value::Reference(links) => Value::Reference(links.iter().map(|l| l.to_string()).collect()),
-        dataline_core::Value::Blob(blob_ref) => Value::Blob(blob_ref.hash().to_string()),
+        dataline_core::Value::Blob(blob_ref) => {
+            Value::Blob { hash: blob_ref.hash().to_string(), filename: blob_ref.filename().map(str::to_string) }
+        }
+        dataline_core::Value::Json(json) => Value::Json(json),
         dataline_core::Value::Empty => Value::Empty,
     }
 }
@@ -186,7 +197,8 @@ pub(crate) fn value_to_core(value: Value) -> Result<dataline_core::Value, DataLi
         // set back through `set_value` — `set_value` itself always rejects a
         // Blob field's value unless it came from `write_blob`, but that
         // check lives in dataline-core, not here.
-        Value::Blob(hash) => dataline_core::Value::Blob(crate::store::blob_ref_from_hash(hash)),
+        Value::Blob { hash, filename } => dataline_core::Value::Blob(crate::store::blob_ref_from_hash(hash, filename)),
+        Value::Json(json) => dataline_core::Value::Json(json),
         Value::Empty => dataline_core::Value::Empty,
     })
 }

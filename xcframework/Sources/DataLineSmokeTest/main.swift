@@ -50,12 +50,26 @@ let record = try store.getRecord(link: fireball)
 check(record.values[nameField] == .text("Fireball"), "Name should round-trip through set_value/get_record")
 check(record.values[costField] == .number(3), "Cost should round-trip through set_value/get_record")
 
-// Blobs.
+// Blobs — content bytes plus an optional filename, both round-tripping
+// through get_record.
 let artworkBytes = Data("pretend PNG bytes".utf8)
-let blobHash = try store.writeBlob(bytes: artworkBytes)
-try store.setValue(link: fireball, fieldId: artworkField, value: .blob(blobHash))
+let blobHash = try store.writeBlob(bytes: artworkBytes, filename: "fireball.png")
+try store.setValue(link: fireball, fieldId: artworkField, value: .blob(hash: blobHash, filename: "fireball.png"))
 let readBack = try store.readBlob(hash: blobHash)
 check(readBack == artworkBytes, "Blob bytes should round-trip through write_blob/read_blob")
+if case .blob(_, let filename) = try store.getRecord(link: fireball).values[artworkField] {
+    check(filename == "fireball.png", "Blob filename should round-trip through set_value/get_record")
+} else {
+    check(false, "expected a .blob value back for the Artwork field")
+}
+
+// JSON — arbitrary structured data the engine stores/returns verbatim.
+let styleField = try store.addField(databaseId: card, name: "Style", kind: .json)
+try store.setValue(link: fireball, fieldId: styleField, value: .json("{\"color\":\"orange\"}"))
+check(
+    try store.getRecord(link: fireball).values[styleField] == .json("{\"color\":\"orange\"}"),
+    "JSON value should round-trip through set_value/get_record"
+)
 
 // References: cross-database and self-referencing.
 let balanceEntry = try store.createRecord(databaseId: balance)
@@ -87,4 +101,14 @@ check(
 )
 check(try store.getRecord(link: frostbolt).values[nameField] == .empty, "cleared value should read back empty")
 
-print("PASS: all \(8) smoke-test checks passed against the real Swift bindings.")
+// Deleting a database also removes any field on another database that
+// referenced it.
+try store.deleteDatabase(databaseId: balance)
+check(store.listDatabases().contains(where: { $0.id == balance }) == false, "deleted database should be gone from list_databases")
+let cardAfterDelete = try store.getDatabase(databaseId: card)
+check(
+    cardAfterDelete.fields.contains(where: { $0.id == balanceField }) == false,
+    "the field referencing the deleted database should be gone too"
+)
+
+print("PASS: all smoke-test checks passed against the real Swift bindings.")

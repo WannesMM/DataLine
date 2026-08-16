@@ -21,6 +21,8 @@ pub enum FieldKind {
     /// without its back-reference counterpart. See Architecture.md §4.
     Reference { target_database: DatabaseId, paired_field: Option<FieldId> },
     Blob,
+    /// See [`crate::record::Value::Json`].
+    Json,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +75,24 @@ impl SchemaRegistry {
         let id = DatabaseId::new();
         self.databases.insert(id, Database { id, name: name.into(), fields: Vec::new() });
         id
+    }
+
+    /// Removes a database, plus every field on any *other* database that
+    /// referenced it — a Reference field never points at a database that no
+    /// longer exists, so removing one bulk-removes every field pointing at
+    /// it, the same guarantee `remove_field` gives for a single pair. Fields
+    /// the removed database owned (including its own paired back-references
+    /// to other databases, and any self-referencing pair) go with it
+    /// automatically since the whole `Database` entry is dropped.
+    pub fn remove_database(&mut self, database_id: DatabaseId) -> Result<()> {
+        self.get_database(database_id)?;
+        self.databases.remove(&database_id);
+        for database in self.databases.values_mut() {
+            database.fields.retain(|field| {
+                !matches!(&field.kind, FieldKind::Reference { target_database, .. } if *target_database == database_id)
+            });
+        }
+        Ok(())
     }
 
     pub fn get_database(&self, id: DatabaseId) -> Result<&Database> {
@@ -452,6 +472,47 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, DataLineError::DatabaseNotFound(missing));
         assert!(registry.get_database(card).unwrap().fields.is_empty(), "no partial field left behind");
+    }
+
+    #[test]
+    fn remove_database_removes_it() {
+        let mut registry = SchemaRegistry::new();
+        let card = registry.create_database("Card");
+        registry.remove_database(card).unwrap();
+        assert_eq!(registry.get_database(card).unwrap_err(), DataLineError::DatabaseNotFound(card));
+    }
+
+    #[test]
+    fn remove_database_removes_fields_referencing_it_from_other_databases() {
+        let mut registry = SchemaRegistry::new();
+        let card = registry.create_database("Card");
+        let balance = registry.create_database("Balance change");
+        registry
+            .add_field(card, "Balance change", FieldKind::Reference { target_database: balance, paired_field: None })
+            .unwrap();
+
+        registry.remove_database(balance).unwrap();
+
+        assert!(registry.get_database(card).unwrap().fields.is_empty(), "the paired back-reference field on the surviving database is gone too");
+    }
+
+    #[test]
+    fn remove_database_with_self_reference_leaves_no_trace() {
+        let mut registry = SchemaRegistry::new();
+        let card = registry.create_database("Card");
+        registry
+            .add_field(card, "Related Cards", FieldKind::Reference { target_database: card, paired_field: None })
+            .unwrap();
+
+        registry.remove_database(card).unwrap();
+        assert_eq!(registry.list_databases().len(), 0);
+    }
+
+    #[test]
+    fn remove_missing_database_errors() {
+        let mut registry = SchemaRegistry::new();
+        let missing = DatabaseId::new();
+        assert_eq!(registry.remove_database(missing).unwrap_err(), DataLineError::DatabaseNotFound(missing));
     }
 
     #[test]

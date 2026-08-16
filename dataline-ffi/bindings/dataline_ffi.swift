@@ -589,11 +589,20 @@ public protocol StoreProtocol: AnyObject, Sendable {
     
     func addField(databaseId: String, name: String, kind: FieldKind) throws  -> String
     
+    /**
+     * Flushes the WAL back into the main database file — call before
+     * copying the store file for a backup snapshot, so the copy is
+     * self-consistent without also needing the `-wal`/`-shm` sidecars.
+     */
+    func checkpoint() throws 
+    
     func createDatabase(name: String) throws  -> String
     
     func createRecord(databaseId: String) throws  -> String
     
     func createReference(sourceLink: String, sourceField: String, targetLink: String) throws  -> Reference
+    
+    func deleteDatabase(databaseId: String) throws 
     
     func deleteRecord(link: String) throws 
     
@@ -627,7 +636,7 @@ public protocol StoreProtocol: AnyObject, Sendable {
     
     func setValue(link: String, fieldId: String, value: Value) throws 
     
-    func writeBlob(bytes: Data) throws  -> String
+    func writeBlob(bytes: Data, filename: String?) throws  -> String
     
 }
 open class Store: StoreProtocol, @unchecked Sendable {
@@ -704,6 +713,19 @@ open func addField(databaseId: String, name: String, kind: FieldKind)throws  -> 
 })
 }
     
+    /**
+     * Flushes the WAL back into the main database file — call before
+     * copying the store file for a backup snapshot, so the copy is
+     * self-consistent without also needing the `-wal`/`-shm` sidecars.
+     */
+open func checkpoint()throws   {try rustCallWithError(FfiConverterTypeDataLineError_lift) {
+        uniffiCallStatus in
+    uniffi_dataline_ffi_fn_method_store_checkpoint(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
 open func createDatabase(name: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeDataLineError_lift) {
         uniffiCallStatus in
@@ -734,6 +756,15 @@ open func createReference(sourceLink: String, sourceField: String, targetLink: S
         FfiConverterString.lower(targetLink),uniffiCallStatus
     )
 })
+}
+    
+open func deleteDatabase(databaseId: String)throws   {try rustCallWithError(FfiConverterTypeDataLineError_lift) {
+        uniffiCallStatus in
+    uniffi_dataline_ffi_fn_method_store_delete_database(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(databaseId),uniffiCallStatus
+    )
+}
 }
     
 open func deleteRecord(link: String)throws   {try rustCallWithError(FfiConverterTypeDataLineError_lift) {
@@ -903,12 +934,13 @@ open func setValue(link: String, fieldId: String, value: Value)throws   {try rus
 }
 }
     
-open func writeBlob(bytes: Data)throws  -> String  {
+open func writeBlob(bytes: Data, filename: String?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeDataLineError_lift) {
         uniffiCallStatus in
     uniffi_dataline_ffi_fn_method_store_write_blob(
             self.uniffiCloneHandle(),
-        FfiConverterData.lower(bytes),uniffiCallStatus
+        FfiConverterData.lower(bytes),
+        FfiConverterOptionString.lower(filename),uniffiCallStatus
     )
 })
 }
@@ -1525,6 +1557,10 @@ public enum FieldKind: Equatable, Hashable {
     case reference(targetDatabase: String, pairedField: String?
     )
     case blob
+    /**
+     * See `dataline_core::Value::Json`'s doc comment.
+     */
+    case json
 
 
 
@@ -1561,6 +1597,8 @@ public struct FfiConverterTypeFieldKind: FfiConverterRustBuffer {
         )
         
         case 7: return .blob
+        
+        case 8: return .json
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1600,6 +1638,10 @@ public struct FfiConverterTypeFieldKind: FfiConverterRustBuffer {
         
         case .blob:
             writeInt(&buf, Int32(7))
+        
+        
+        case .json:
+            writeInt(&buf, Int32(8))
         
         }
     }
@@ -1644,9 +1686,16 @@ public enum Value: Equatable, Hashable {
     case reference([String]
     )
     /**
-     * A blob's content hash, as returned by `Store::write_blob`.
+     * `hash` is a blob's content hash, as returned by `Store::write_blob`.
+     * `filename` is whatever was passed to `write_blob`, if anything —
+     * `None` for a blob written without one, not a lookup failure.
      */
-    case blob(String
+    case blob(hash: String, filename: String?
+    )
+    /**
+     * Raw JSON text — see `dataline_core::Value::Json`'s doc comment.
+     */
+    case json(String
     )
     case empty
 
@@ -1688,10 +1737,13 @@ public struct FfiConverterTypeValue: FfiConverterRustBuffer {
         case 6: return .reference(try FfiConverterSequenceString.read(from: &buf)
         )
         
-        case 7: return .blob(try FfiConverterString.read(from: &buf)
+        case 7: return .blob(hash: try FfiConverterString.read(from: &buf), filename: try FfiConverterOptionString.read(from: &buf)
         )
         
-        case 8: return .empty
+        case 8: return .json(try FfiConverterString.read(from: &buf)
+        )
+        
+        case 9: return .empty
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1731,13 +1783,19 @@ public struct FfiConverterTypeValue: FfiConverterRustBuffer {
             FfiConverterSequenceString.write(v1, into: &buf)
             
         
-        case let .blob(v1):
+        case let .blob(hash,filename):
             writeInt(&buf, Int32(7))
+            FfiConverterString.write(hash, into: &buf)
+            FfiConverterOptionString.write(filename, into: &buf)
+            
+        
+        case let .json(v1):
+            writeInt(&buf, Int32(8))
             FfiConverterString.write(v1, into: &buf)
             
         
         case .empty:
-            writeInt(&buf, Int32(8))
+            writeInt(&buf, Int32(9))
         
         }
     }
@@ -1994,6 +2052,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_dataline_ffi_checksum_method_store_add_field() != 64269) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_dataline_ffi_checksum_method_store_checkpoint() != 64166) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_dataline_ffi_checksum_method_store_create_database() != 46173) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2001,6 +2062,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_dataline_ffi_checksum_method_store_create_reference() != 13465) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dataline_ffi_checksum_method_store_delete_database() != 39385) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_dataline_ffi_checksum_method_store_delete_record() != 31450) {
@@ -2051,7 +2115,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_dataline_ffi_checksum_method_store_set_value() != 24026) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_dataline_ffi_checksum_method_store_write_blob() != 55483) {
+    if (uniffi_dataline_ffi_checksum_method_store_write_blob() != 56094) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_dataline_ffi_checksum_constructor_store_open() != 48682) {
