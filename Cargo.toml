@@ -1,3 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["dataline-core", "dataline-ffi", "dataline-cli"]
+members = ["dataline-core", "dataline-cli"]
+# dataline-ffi is uniffi glue written for the Swift host; it stays in the
+# tree but out of the workspace build until it's updated for dataline-core's
+# newer schema (Custom/CustomBlob field kinds) and reviewed as a Line plugin —
+# same convention the Line monorepo's own root Cargo.toml already uses
+# (member paths and excluded paths can't overlap, so it's just left out of
+# `members` here rather than also listed in `exclude`).
+exclude = ["dataline-ffi"]

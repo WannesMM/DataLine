@@ -23,6 +23,21 @@ pub enum FieldKind {
     Blob,
     /// See [`crate::record::Value::Json`].
     Json,
+    /// A plugin-declared field kind. `kind_id` names the plugin capability
+    /// that owns this kind's meaning (DataLine never interprets it beyond
+    /// carrying it through storage/queries) — two `Custom` fields are only
+    /// ever compatible with each other when their `kind_id`s match, which is
+    /// the whole point of the tag: it lets a consumer (BaseLine's Mapping
+    /// system) check compatibility without DataLine needing to know what
+    /// either plugin's data actually means. See Architecture.md's Custom
+    /// field kind note (added alongside PowerLine's plugin rework).
+    Custom { kind_id: String },
+    /// See [`crate::record::Value::CustomBlob`] — the content-addressed
+    /// counterpart to `Custom`, for a plugin's large-media values (real
+    /// motivating case: a Music plugin's audio bytes needing the same
+    /// lazy, deduplicated loading `Blob` fields already get, while still
+    /// carrying a `kind_id` tag `Blob` alone has no room for).
+    CustomBlob { kind_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]

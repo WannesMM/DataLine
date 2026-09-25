@@ -42,7 +42,7 @@ use crate::record::{BlobRef, Record, Value};
 use crate::reference::Reference;
 use crate::schema::{Database, FieldDefinition, FieldKind, SchemaRegistry, SelectionOption};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// What happened to existing records' values when [`Store::retype_field`]
 /// changed a field's kind. Per Architecture.md §7, a retype never silently
@@ -357,8 +357,10 @@ impl Store {
     /// it can only produce a bare-hash `BlobRef`; this is the one place that
     /// hydrates it into the real thing `get_record`/`list_records` return.
     fn hydrate_blob_filename(&self, value: &mut Value) -> Result<()> {
-        if let Value::Blob(blob_ref) = value {
-            blob_ref.filename = self.blob_filename(&blob_ref.hash)?;
+        match value {
+            Value::Blob(blob_ref) => blob_ref.filename = self.blob_filename(&blob_ref.hash)?,
+            Value::CustomBlob { blob, .. } => blob.filename = self.blob_filename(&blob.hash)?,
+            _ => {}
         }
         Ok(())
     }
@@ -399,7 +401,12 @@ impl Store {
         if let FieldKind::Reference { .. } = &field.kind {
             return Err(DataLineError::UnsupportedFieldKindForValue { field: field_id, kind: kind_label(&field.kind) });
         }
-        if let (FieldKind::Blob, Value::Blob(blob_ref)) = (&field.kind, &value) {
+        let blob_ref_to_check: Option<&BlobRef> = match (&field.kind, &value) {
+            (FieldKind::Blob, Value::Blob(blob_ref)) => Some(blob_ref),
+            (FieldKind::CustomBlob { .. }, Value::CustomBlob { blob, .. }) => Some(blob),
+            _ => None,
+        };
+        if let Some(blob_ref) = blob_ref_to_check {
             let exists: bool = self
                 .conn
                 .query_row("SELECT EXISTS(SELECT 1 FROM blobs WHERE hash = ?1)", params![blob_ref.hash()], |row| {
@@ -904,6 +911,8 @@ fn scalar_sql_type(kind: &FieldKind) -> Option<&'static str> {
         FieldKind::Blob => Some("TEXT"), // stores a content hash, not bytes — see Architecture.md §5
         FieldKind::Selection { .. } => Some("TEXT"),
         FieldKind::Json => Some("TEXT"), // stores raw JSON text — see Value::Json
+        FieldKind::Custom { .. } => Some("BLOB"), // inline opaque bytes — see Value::Custom
+        FieldKind::CustomBlob { .. } => Some("TEXT"), // stores a content hash, not bytes — same as Blob
         FieldKind::Reference { .. } => None,
     }
 }
@@ -917,6 +926,8 @@ fn kind_label(kind: &FieldKind) -> &'static str {
         FieldKind::Selection { .. } => "selection",
         FieldKind::Blob => "blob",
         FieldKind::Json => "json",
+        FieldKind::Custom { .. } => "custom",
+        FieldKind::CustomBlob { .. } => "custom_blob",
         FieldKind::Reference { .. } => "reference",
     }
 }
@@ -947,6 +958,7 @@ fn create_schema_tables(conn: &Connection) -> rusqlite::Result<()> {
              selection_options TEXT,
              reference_target_database TEXT,
              reference_paired_field TEXT,
+             custom_kind_id TEXT,
              ordering INTEGER NOT NULL
          );
          CREATE TABLE links (
@@ -978,6 +990,8 @@ type MigrationStep = fn(&Transaction) -> rusqlite::Result<()>;
 const MIGRATIONS: &[(i64, MigrationStep)] = &[
     // v1 -> v2: adds `blobs.filename`.
     (1, |tx| tx.execute("ALTER TABLE blobs ADD COLUMN filename TEXT", []).map(|_| ())),
+    // v2 -> v3: adds `fields.custom_kind_id`, for FieldKind::Custom.
+    (2, |tx| tx.execute("ALTER TABLE fields ADD COLUMN custom_kind_id TEXT", []).map(|_| ())),
 ];
 
 /// Checks the store's schema version, migrating forward in place through
@@ -1026,8 +1040,8 @@ fn check_schema_version(conn: &mut Connection) -> Result<()> {
 fn insert_field_row(tx: &Transaction, database_id: DatabaseId, field: &FieldDefinition) -> rusqlite::Result<()> {
     let encoded = encode_kind(&field.kind)?;
     tx.execute(
-        "INSERT INTO fields (id, database_id, name, kind, selection_multi, selection_options, reference_target_database, reference_paired_field, ordering)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO fields (id, database_id, name, kind, selection_multi, selection_options, reference_target_database, reference_paired_field, custom_kind_id, ordering)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             field.id.as_uuid().to_string(),
             database_id.as_uuid().to_string(),
@@ -1037,6 +1051,7 @@ fn insert_field_row(tx: &Transaction, database_id: DatabaseId, field: &FieldDefi
             encoded.selection_options,
             encoded.reference_target_database,
             encoded.reference_paired_field,
+            encoded.custom_kind_id,
             field.ordering,
         ],
     )?;
@@ -1055,14 +1070,16 @@ fn update_field_kind_row(tx: &Transaction, field_id: FieldId, kind: &FieldKind) 
     let encoded = encode_kind(kind)?;
     tx.execute(
         "UPDATE fields SET kind = ?1, selection_multi = ?2, selection_options = ?3,
-                           reference_target_database = ?4, reference_paired_field = ?5
-         WHERE id = ?6",
+                           reference_target_database = ?4, reference_paired_field = ?5,
+                           custom_kind_id = ?6
+         WHERE id = ?7",
         params![
             encoded.kind_tag,
             encoded.selection_multi,
             encoded.selection_options,
             encoded.reference_target_database,
             encoded.reference_paired_field,
+            encoded.custom_kind_id,
             field_id.as_uuid().to_string(),
         ],
     )?;
@@ -1075,6 +1092,7 @@ struct EncodedKind {
     selection_options: Option<String>,
     reference_target_database: Option<String>,
     reference_paired_field: Option<String>,
+    custom_kind_id: Option<String>,
 }
 
 fn encode_kind(kind: &FieldKind) -> rusqlite::Result<EncodedKind> {
@@ -1084,6 +1102,7 @@ fn encode_kind(kind: &FieldKind) -> rusqlite::Result<EncodedKind> {
         selection_options: None,
         reference_target_database: None,
         reference_paired_field: None,
+        custom_kind_id: None,
     };
     Ok(match kind {
         FieldKind::Text | FieldKind::Number | FieldKind::Boolean | FieldKind::Date | FieldKind::Blob | FieldKind::Json => {
@@ -1105,6 +1124,9 @@ fn encode_kind(kind: &FieldKind) -> rusqlite::Result<EncodedKind> {
             reference_paired_field: paired_field.map(|f| f.as_uuid().to_string()),
             ..empty
         },
+        FieldKind::Custom { kind_id } | FieldKind::CustomBlob { kind_id } => {
+            EncodedKind { kind_tag: kind_label(kind), custom_kind_id: Some(kind_id.clone()), ..empty }
+        }
     })
 }
 
@@ -1114,6 +1136,7 @@ fn decode_kind(
     selection_options: Option<String>,
     reference_target_database: Option<String>,
     reference_paired_field: Option<String>,
+    custom_kind_id: Option<String>,
 ) -> Result<FieldKind> {
     Ok(match tag {
         "text" => FieldKind::Text,
@@ -1137,6 +1160,16 @@ fn decode_kind(
             let paired_field = reference_paired_field.map(|s| parse_uuid(&s)).transpose()?.map(FieldId::from_uuid);
             FieldKind::Reference { target_database, paired_field }
         }
+        "custom" => {
+            let kind_id = custom_kind_id
+                .ok_or_else(|| DataLineError::Storage("custom field missing kind_id".into()))?;
+            FieldKind::Custom { kind_id }
+        }
+        "custom_blob" => {
+            let kind_id = custom_kind_id
+                .ok_or_else(|| DataLineError::Storage("custom_blob field missing kind_id".into()))?;
+            FieldKind::CustomBlob { kind_id }
+        }
         other => return Err(DataLineError::Storage(format!("unknown field kind '{other}' in store"))),
     })
 }
@@ -1159,7 +1192,7 @@ fn load_registry(conn: &Connection) -> Result<SchemaRegistry> {
 
     for db in &mut databases {
         let mut stmt = conn.prepare(
-            "SELECT id, name, kind, selection_multi, selection_options, reference_target_database, reference_paired_field, ordering
+            "SELECT id, name, kind, selection_multi, selection_options, reference_target_database, reference_paired_field, custom_kind_id, ordering
              FROM fields WHERE database_id = ?1 ORDER BY ordering",
         )?;
         let rows = stmt.query_map(params![db.id.as_uuid().to_string()], |row| {
@@ -1171,14 +1204,15 @@ fn load_registry(conn: &Connection) -> Result<SchemaRegistry> {
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
-                row.get::<_, i32>(7)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i32>(8)?,
             ))
         })?;
 
         for row in rows {
-            let (id_str, name, kind_tag, selection_multi, selection_options, ref_target, ref_paired, ordering) = row?;
+            let (id_str, name, kind_tag, selection_multi, selection_options, ref_target, ref_paired, custom_kind_id, ordering) = row?;
             let id = FieldId::from_uuid(parse_uuid(&id_str)?);
-            let kind = decode_kind(&kind_tag, selection_multi, selection_options, ref_target, ref_paired)?;
+            let kind = decode_kind(&kind_tag, selection_multi, selection_options, ref_target, ref_paired, custom_kind_id)?;
             db.fields.push(FieldDefinition { id, name, kind, ordering });
         }
     }
@@ -1219,6 +1253,18 @@ fn encode_scalar_value(field_id: FieldId, kind: &FieldKind, value: &Value) -> Re
                 .map_err(|e| DataLineError::Storage(format!("invalid JSON value: {e}")))?;
             Ok(SqlValue::Text(json.clone()))
         }
+        (FieldKind::Custom { kind_id: field_kind_id }, Value::Custom { kind_id: value_kind_id, data }) => {
+            if field_kind_id != value_kind_id {
+                return Err(DataLineError::ValueKindMismatch { field: field_id, expected: kind_label(kind) });
+            }
+            Ok(SqlValue::Blob(data.clone()))
+        }
+        (FieldKind::CustomBlob { kind_id: field_kind_id }, Value::CustomBlob { kind_id: value_kind_id, blob }) => {
+            if field_kind_id != value_kind_id {
+                return Err(DataLineError::ValueKindMismatch { field: field_id, expected: kind_label(kind) });
+            }
+            Ok(SqlValue::Text(blob.hash.clone()))
+        }
         _ => Err(DataLineError::ValueKindMismatch { field: field_id, expected: kind_label(kind) }),
     }
 }
@@ -1246,6 +1292,10 @@ fn decode_scalar_value(kind: &FieldKind, sql_value: rusqlite::types::Value) -> R
         }
         FieldKind::Blob => Value::Blob(BlobRef::from_hash(expect_text(sql_value)?)),
         FieldKind::Json => Value::Json(expect_text(sql_value)?),
+        FieldKind::Custom { kind_id } => Value::Custom { kind_id: kind_id.clone(), data: expect_blob(sql_value)? },
+        FieldKind::CustomBlob { kind_id } => {
+            Value::CustomBlob { kind_id: kind_id.clone(), blob: BlobRef::from_hash(expect_text(sql_value)?) }
+        }
         FieldKind::Reference { .. } => {
             unreachable!("reference fields never get a column on their owning table (Architecture.md §3)")
         }
@@ -1275,6 +1325,21 @@ fn coerce_value(value: &Value, target_kind: &FieldKind) -> Value {
         (Value::Date(_), FieldKind::Date) => value.clone(),
         (Value::Blob(_), FieldKind::Blob) => value.clone(),
         (Value::Json(_), FieldKind::Json) => value.clone(),
+        // Lossless in both directions — a `Blob`/`CustomBlob` value is just
+        // a `BlobRef` either way (same shared, content-addressed blob
+        // table), so retyping between them is purely "gain/drop a plugin
+        // tag," never a real content conversion. This is the actual
+        // migration path a plugin-owned field like Music's storage field
+        // uses to move from an untagged `Blob` onto its own `CustomBlob`
+        // kind_id without losing (or having to rewrite) the underlying
+        // bytes. See Architecture.md's CustomBlob note.
+        (Value::Blob(blob_ref), FieldKind::CustomBlob { kind_id }) => {
+            Value::CustomBlob { kind_id: kind_id.clone(), blob: blob_ref.clone() }
+        }
+        (Value::CustomBlob { blob, .. }, FieldKind::Blob) => Value::Blob(blob.clone()),
+        (Value::CustomBlob { blob, .. }, FieldKind::CustomBlob { kind_id }) => {
+            Value::CustomBlob { kind_id: kind_id.clone(), blob: blob.clone() }
+        }
         (Value::Selection(names), FieldKind::Selection { options, .. }) => {
             // Also how a Selection option removal is handled: retyping a
             // field to itself with a narrower `options` list drops any
@@ -1346,6 +1411,13 @@ fn expect_integer(v: rusqlite::types::Value) -> Result<i64> {
     match v {
         rusqlite::types::Value::Integer(n) => Ok(n),
         other => Err(DataLineError::Storage(format!("expected an INTEGER column value, got {other:?}"))),
+    }
+}
+
+fn expect_blob(v: rusqlite::types::Value) -> Result<Vec<u8>> {
+    match v {
+        rusqlite::types::Value::Blob(b) => Ok(b),
+        other => Err(DataLineError::Storage(format!("expected a BLOB column value, got {other:?}"))),
     }
 }
 
@@ -1569,6 +1641,213 @@ mod tests {
         }
         let store = Store::open(&path).unwrap();
         assert_eq!(store.get_record(link).unwrap().values[&field], Value::Json(r#"{"a":1}"#.into()));
+    }
+
+    #[test]
+    fn set_value_round_trips_custom() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp_store_path(&dir)).unwrap();
+        let card = store.create_database("Card").unwrap();
+        let field = store
+            .add_field(card, "Track", FieldKind::Custom { kind_id: "com.myline.music".into() })
+            .unwrap();
+        let link = store.create_record(card).unwrap();
+
+        store
+            .set_value(
+                link,
+                field,
+                Value::Custom { kind_id: "com.myline.music".into(), data: vec![1, 2, 3, 4] },
+            )
+            .unwrap();
+
+        let record = store.get_record(link).unwrap();
+        assert_eq!(
+            record.values[&field],
+            Value::Custom { kind_id: "com.myline.music".into(), data: vec![1, 2, 3, 4] }
+        );
+    }
+
+    #[test]
+    fn set_value_rejects_custom_kind_id_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp_store_path(&dir)).unwrap();
+        let card = store.create_database("Card").unwrap();
+        let field = store
+            .add_field(card, "Track", FieldKind::Custom { kind_id: "com.myline.music".into() })
+            .unwrap();
+        let link = store.create_record(card).unwrap();
+
+        let err = store
+            .set_value(link, field, Value::Custom { kind_id: "com.myline.image".into(), data: vec![9] })
+            .unwrap_err();
+        assert!(matches!(err, DataLineError::ValueKindMismatch { .. }));
+    }
+
+    #[test]
+    fn custom_field_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_store_path(&dir);
+        let card;
+        let field;
+        let link;
+        {
+            let mut store = Store::open(&path).unwrap();
+            card = store.create_database("Card").unwrap();
+            field = store
+                .add_field(card, "Track", FieldKind::Custom { kind_id: "com.myline.music".into() })
+                .unwrap();
+            link = store.create_record(card).unwrap();
+            store
+                .set_value(
+                    link,
+                    field,
+                    Value::Custom { kind_id: "com.myline.music".into(), data: vec![5, 6, 7] },
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.get_database(card).unwrap().field(field).unwrap().kind,
+            FieldKind::Custom { kind_id: "com.myline.music".into() }
+        );
+        assert_eq!(
+            store.get_record(link).unwrap().values[&field],
+            Value::Custom { kind_id: "com.myline.music".into(), data: vec![5, 6, 7] }
+        );
+    }
+
+    #[test]
+    fn set_value_round_trips_custom_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp_store_path(&dir)).unwrap();
+        let card = store.create_database("Card").unwrap();
+        let field = store
+            .add_field(card, "Track", FieldKind::CustomBlob { kind_id: "com.myline.music.value".into() })
+            .unwrap();
+        let link = store.create_record(card).unwrap();
+        let blob_ref = store.write_blob(b"fake audio bytes", Some("song.mp3")).unwrap();
+
+        store
+            .set_value(
+                link,
+                field,
+                Value::CustomBlob { kind_id: "com.myline.music.value".into(), blob: blob_ref.clone() },
+            )
+            .unwrap();
+
+        let record = store.get_record(link).unwrap();
+        assert_eq!(
+            record.values[&field],
+            Value::CustomBlob { kind_id: "com.myline.music.value".into(), blob: blob_ref }
+        );
+    }
+
+    #[test]
+    fn set_value_rejects_custom_blob_kind_id_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp_store_path(&dir)).unwrap();
+        let card = store.create_database("Card").unwrap();
+        let field = store
+            .add_field(card, "Track", FieldKind::CustomBlob { kind_id: "com.myline.music.value".into() })
+            .unwrap();
+        let link = store.create_record(card).unwrap();
+        let blob_ref = store.write_blob(b"fake audio bytes", None).unwrap();
+
+        let err = store
+            .set_value(link, field, Value::CustomBlob { kind_id: "com.myline.image.value".into(), blob: blob_ref })
+            .unwrap_err();
+        assert!(matches!(err, DataLineError::ValueKindMismatch { .. }));
+    }
+
+    /// The exact gap-2 motivating scenario: a CustomBlob value pointing at
+    /// a hash that was never actually written should be caught the same
+    /// way an ordinary dangling `Blob` reference already is — never
+    /// silently accepted, per `set_value`'s own doc comment.
+    #[test]
+    fn set_value_rejects_dangling_custom_blob_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp_store_path(&dir)).unwrap();
+        let card = store.create_database("Card").unwrap();
+        let field = store
+            .add_field(card, "Track", FieldKind::CustomBlob { kind_id: "com.myline.music.value".into() })
+            .unwrap();
+        let link = store.create_record(card).unwrap();
+        let bogus = BlobRef::from_hash("not-a-real-hash");
+
+        let err = store
+            .set_value(link, field, Value::CustomBlob { kind_id: "com.myline.music.value".into(), blob: bogus.clone() })
+            .unwrap_err();
+        assert_eq!(err, DataLineError::BlobNotFound(bogus));
+    }
+
+    /// Proves the actual point of `CustomBlob` over `Custom`: the blob
+    /// table stays the single source of truth for the bytes — two
+    /// `CustomBlob` values pointing at identical content share one blob
+    /// row, same content-addressed dedup `Blob` fields already get, and
+    /// the filename set on first write survives being read back through a
+    /// completely different field/record.
+    #[test]
+    fn custom_blob_shares_content_addressed_storage_with_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp_store_path(&dir)).unwrap();
+        let card = store.create_database("Card").unwrap();
+        let field = store
+            .add_field(card, "Track", FieldKind::CustomBlob { kind_id: "com.myline.music.value".into() })
+            .unwrap();
+        let a = store.create_record(card).unwrap();
+        let b = store.create_record(card).unwrap();
+
+        let first = store.write_blob(b"same bytes", Some("first-name.mp3")).unwrap();
+        let second = store.write_blob(b"same bytes", Some("second-name.mp3")).unwrap();
+        assert_eq!(first.hash, second.hash, "identical content must dedupe to the same hash");
+
+        store
+            .set_value(a, field, Value::CustomBlob { kind_id: "com.myline.music.value".into(), blob: first })
+            .unwrap();
+        store
+            .set_value(b, field, Value::CustomBlob { kind_id: "com.myline.music.value".into(), blob: second })
+            .unwrap();
+
+        let Value::CustomBlob { blob: a_blob, .. } = &store.get_record(a).unwrap().values[&field] else {
+            panic!("expected a CustomBlob value");
+        };
+        assert_eq!(a_blob.filename(), Some("first-name.mp3"), "dedup keeps whichever filename was stored first");
+    }
+
+    #[test]
+    fn custom_blob_field_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_store_path(&dir);
+        let card;
+        let field;
+        let link;
+        let blob_ref;
+        {
+            let mut store = Store::open(&path).unwrap();
+            card = store.create_database("Card").unwrap();
+            field = store
+                .add_field(card, "Track", FieldKind::CustomBlob { kind_id: "com.myline.music.value".into() })
+                .unwrap();
+            link = store.create_record(card).unwrap();
+            blob_ref = store.write_blob(b"reopen bytes", Some("reopen.mp3")).unwrap();
+            store
+                .set_value(
+                    link,
+                    field,
+                    Value::CustomBlob { kind_id: "com.myline.music.value".into(), blob: blob_ref.clone() },
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.get_database(card).unwrap().field(field).unwrap().kind,
+            FieldKind::CustomBlob { kind_id: "com.myline.music.value".into() }
+        );
+        assert_eq!(
+            store.get_record(link).unwrap().values[&field],
+            Value::CustomBlob { kind_id: "com.myline.music.value".into(), blob: blob_ref }
+        );
     }
 
     #[test]
@@ -2376,6 +2655,36 @@ mod tests {
         assert!(report.cleared_links.is_empty());
         assert_eq!(store.get_database(card).unwrap().field(cost_field).unwrap().kind, FieldKind::Text);
         assert_eq!(store.get_record(fireball).unwrap().values[&cost_field], Value::Text("3".into()));
+    }
+
+    /// The exact gap-2 migration path: an existing `Blob` field (Music's
+    /// storage field before this feature existed) retypes onto its own
+    /// plugin-tagged `CustomBlob` kind without losing or rewriting the
+    /// underlying bytes — just gaining a `kind_id` tag. This is what lets
+    /// a real, already-populated project adopt `CustomBlob` safely.
+    #[test]
+    fn retype_field_from_blob_to_custom_blob_is_lossless() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp_store_path(&dir)).unwrap();
+        let card = store.create_database("Card").unwrap();
+        let track_field = store.add_field(card, "Track", FieldKind::Blob).unwrap();
+        let link = store.create_record(card).unwrap();
+        let blob_ref = store.write_blob(b"real audio bytes", Some("song.mp3")).unwrap();
+        store.set_value(link, track_field, Value::Blob(blob_ref.clone())).unwrap();
+
+        let report = store
+            .retype_field(card, track_field, FieldKind::CustomBlob { kind_id: "com.myline.music.value".into() })
+            .unwrap();
+
+        assert!(report.cleared_links.is_empty(), "retyping Blob->CustomBlob must never clear a value");
+        assert_eq!(
+            store.get_database(card).unwrap().field(track_field).unwrap().kind,
+            FieldKind::CustomBlob { kind_id: "com.myline.music.value".into() }
+        );
+        assert_eq!(
+            store.get_record(link).unwrap().values[&track_field],
+            Value::CustomBlob { kind_id: "com.myline.music.value".into(), blob: blob_ref }
+        );
     }
 
     #[test]
